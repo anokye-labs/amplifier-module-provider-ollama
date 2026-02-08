@@ -15,6 +15,8 @@ from uuid import uuid4
 
 from amplifier_core import AuthenticationError  # pyright: ignore[reportAttributeAccessIssue]
 from amplifier_core import ConfigField
+from amplifier_core import ContentFilterError  # pyright: ignore[reportAttributeAccessIssue]
+from amplifier_core import ContextLengthError  # pyright: ignore[reportAttributeAccessIssue]
 from amplifier_core import InvalidRequestError  # pyright: ignore[reportAttributeAccessIssue]
 from amplifier_core import LLMError  # pyright: ignore[reportAttributeAccessIssue]
 from amplifier_core import LLMTimeoutError  # pyright: ignore[reportAttributeAccessIssue]
@@ -22,6 +24,7 @@ from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ProviderInfo
 from amplifier_core import ProviderUnavailableError  # pyright: ignore[reportAttributeAccessIssue]
+from amplifier_core import RateLimitError  # pyright: ignore[reportAttributeAccessIssue]
 from amplifier_core import TextContent
 from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
@@ -106,7 +109,18 @@ def _translate_ollama_error(e: Exception) -> LLMError:  # pyright: ignore[report
         status = getattr(e, "status_code", None)
         if status in (401, 403):
             return AuthenticationError(str(e), provider="ollama", status_code=status)  # pyright: ignore[reportReturnType]
+        if status == 429:
+            return RateLimitError(str(e), provider="ollama", status_code=429)  # pyright: ignore[reportReturnType]
         if status == 400:
+            msg = str(e).lower()
+            if (
+                "context length" in msg
+                or "too many tokens" in msg
+                or "token limit" in msg
+            ):
+                return ContextLengthError(str(e), provider="ollama", status_code=400)  # pyright: ignore[reportReturnType]
+            if "content filter" in msg or "safety" in msg or "blocked" in msg:
+                return ContentFilterError(str(e), provider="ollama", status_code=400)  # pyright: ignore[reportReturnType]
             return InvalidRequestError(str(e), provider="ollama", status_code=status)  # pyright: ignore[reportReturnType]
         if status is not None and 500 <= status < 600:
             return ProviderUnavailableError(

@@ -7,10 +7,13 @@ from unittest.mock import AsyncMock
 import pytest
 from amplifier_core import (
     AuthenticationError,
+    ContentFilterError,
+    ContextLengthError,
     InvalidRequestError,
     LLMError,
     LLMTimeoutError,
     ProviderUnavailableError,
+    RateLimitError,
 )
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message
@@ -82,11 +85,35 @@ class TestTranslateOllamaError:
         assert result.provider == "ollama"
         assert result.status_code == 403
 
+    def test_response_error_429(self):
+        err = ResponseError("rate limit exceeded")
+        err.status_code = 429
+        result = _translate_ollama_error(err)
+        assert isinstance(result, RateLimitError)
+        assert result.provider == "ollama"
+        assert result.status_code == 429
+
     def test_response_error_400(self):
         err = ResponseError("bad request")
         err.status_code = 400
         result = _translate_ollama_error(err)
         assert isinstance(result, InvalidRequestError)
+        assert result.provider == "ollama"
+        assert result.status_code == 400
+
+    def test_response_error_400_context_length(self):
+        err = ResponseError("context length exceeded")
+        err.status_code = 400
+        result = _translate_ollama_error(err)
+        assert isinstance(result, ContextLengthError)
+        assert result.provider == "ollama"
+        assert result.status_code == 400
+
+    def test_response_error_400_content_filter(self):
+        err = ResponseError("content blocked by safety filter")
+        err.status_code = 400
+        result = _translate_ollama_error(err)
+        assert isinstance(result, ContentFilterError)
         assert result.provider == "ollama"
         assert result.status_code == 400
 
