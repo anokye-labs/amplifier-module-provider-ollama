@@ -14,6 +14,16 @@ from typing import Any
 from uuid import uuid4
 
 from amplifier_core import ConfigField
+from amplifier_core.llm_errors import (
+    AuthenticationError,
+    ContentFilterError,
+    ContextLengthError,
+    InvalidRequestError,
+    LLMError,
+    LLMTimeoutError,
+    ProviderUnavailableError,
+    RateLimitError,
+)
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ProviderInfo
@@ -85,6 +95,47 @@ def _truncate_values(
             _truncate_values(item, max_length, max_depth, _depth + 1) for item in obj
         ]
     return obj
+
+
+def _translate_ollama_error(e: Exception) -> LLMError:  # pyright: ignore[reportReturnType]
+    """Translate native Ollama/connection errors to kernel LLM error types.
+
+    Called at the OUTER level after ``_retry_with_backoff`` has exhausted
+    retries for transient connection errors.  ``ResponseError`` passes
+    through retry immediately (never retried).
+
+    The returned exception should be raised with ``raise ... from e`` to
+    preserve the original ``__cause__``.
+    """
+    if isinstance(e, ResponseError):
+        status = getattr(e, "status_code", None)
+        if status in (401, 403):
+            return AuthenticationError(str(e), provider="ollama", status_code=status)  # pyright: ignore[reportReturnType]
+        if status == 429:
+            return RateLimitError(str(e), provider="ollama", status_code=429)  # pyright: ignore[reportReturnType]
+        if status == 400:
+            msg = str(e).lower()
+            if (
+                "context length" in msg
+                or "too many tokens" in msg
+                or "token limit" in msg
+            ):
+                return ContextLengthError(str(e), provider="ollama", status_code=400)  # pyright: ignore[reportReturnType]
+            if "content filter" in msg or "safety" in msg or "blocked" in msg:
+                return ContentFilterError(str(e), provider="ollama", status_code=400)  # pyright: ignore[reportReturnType]
+            return InvalidRequestError(str(e), provider="ollama", status_code=status)  # pyright: ignore[reportReturnType]
+        if status is not None and 500 <= status < 600:
+            return ProviderUnavailableError(
+                str(e), provider="ollama", status_code=status
+            )  # pyright: ignore[reportReturnType]
+        return LLMError(str(e), provider="ollama", retryable=True)
+    # TimeoutError is a subclass of OSError in Python 3.11+, so check it
+    # *before* the broader (ConnectionError, OSError) catch.
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return LLMTimeoutError(str(e), provider="ollama")  # pyright: ignore[reportReturnType]
+    if isinstance(e, (ConnectionError, OSError)):
+        return ProviderUnavailableError(str(e), provider="ollama", retryable=True)  # pyright: ignore[reportReturnType]
+    return LLMError(str(e), provider="ollama", retryable=True)
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -495,14 +546,16 @@ class OllamaProvider:
                         f"Retrying in {delay}s..."
                     )
                     if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        # Event renamed from "ollama:retry" to "provider:retry" for
+                        # cross-provider consistency (Phase 2). Hooks subscribed to
+                        # "ollama:retry" need updating.
                         await self.coordinator.hooks.emit(
-                            "ollama:retry",
+                            "provider:retry",
                             {
+                                "provider": self.name,
                                 "attempt": attempt + 1,
-                                "max_retries": self.MAX_RETRIES,
                                 "delay": delay,
-                                "error": str(e),
-                                "description": description,
+                                "error_type": type(e).__name__,
                             },
                         )
                     await asyncio.sleep(delay)
@@ -678,11 +731,19 @@ class OllamaProvider:
         # Enable thinking/reasoning only for models that support it
         # think is a top-level parameter (not inside options) since Ollama v0.9.0
         # Supports boolean True or effort levels: "high", "medium", "low"
+        #
+        # Precedence: kwargs/request.enable_thinking → request.reasoning_effort
+        #             → provider config (self.enable_thinking) → default off
         include_thinking = False
         model_caps = self._detect_model_capabilities(model)
         if "thinking" in model_caps:
             if hasattr(request, "enable_thinking") and request.enable_thinking:  # pyright: ignore[reportAttributeAccessIssue]
                 params["think"] = self.thinking_effort or True
+                include_thinking = True
+            elif request.reasoning_effort is not None:
+                # Ollama v0.9.0+ supports effort levels ("high", "medium", "low")
+                # via the `think` parameter — pass through directly.
+                params["think"] = request.reasoning_effort
                 include_thinking = True
             elif self.enable_thinking:
                 params["think"] = self.thinking_effort or True
@@ -800,7 +861,7 @@ class OllamaProvider:
                 response, include_thinking=include_thinking
             )
 
-        except TimeoutError:
+        except TimeoutError as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
             logger.error(f"[PROVIDER] Ollama API call timed out after {self.timeout}s")
 
@@ -816,7 +877,10 @@ class OllamaProvider:
                         "error": f"Request timed out after {self.timeout}s",
                     },
                 )
-            raise TimeoutError(f"Ollama API call timed out after {self.timeout}s")
+            raise LLMTimeoutError(
+                f"Ollama API call timed out after {self.timeout}s",
+                provider="ollama",
+            ) from e
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -834,7 +898,7 @@ class OllamaProvider:
                         "error": str(e),
                     },
                 )
-            raise
+            raise _translate_ollama_error(e) from e
 
     async def _complete_streaming(
         self, request: ChatRequest, **kwargs
@@ -980,11 +1044,19 @@ class OllamaProvider:
 
         # Enable thinking/reasoning only for models that support it
         # think is a top-level parameter (not inside options) since Ollama v0.9.0
+        #
+        # Precedence: kwargs/request.enable_thinking → request.reasoning_effort
+        #             → provider config (self.enable_thinking) → default off
         include_thinking = False
         model_caps = self._detect_model_capabilities(model)
         if "thinking" in model_caps:
             if hasattr(request, "enable_thinking") and request.enable_thinking:  # pyright: ignore[reportAttributeAccessIssue]
                 params["think"] = self.thinking_effort or True
+                include_thinking = True
+            elif request.reasoning_effort is not None:  # pyright: ignore[reportAttributeAccessIssue]
+                # Ollama v0.9.0+ supports effort levels ("high", "medium", "low")
+                # via the `think` parameter — pass through directly.
+                params["think"] = request.reasoning_effort  # pyright: ignore[reportAttributeAccessIssue]
                 include_thinking = True
             elif self.enable_thinking:
                 params["think"] = self.thinking_effort or True
@@ -1149,7 +1221,7 @@ class OllamaProvider:
                 include_thinking,
             )
 
-        except TimeoutError:
+        except TimeoutError as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
             logger.error(f"[PROVIDER] Streaming timed out after {self.timeout}s")
 
@@ -1164,7 +1236,10 @@ class OllamaProvider:
                         "stream": True,
                     },
                 )
-            raise TimeoutError(f"Ollama streaming timed out after {self.timeout}s")
+            raise LLMTimeoutError(
+                f"Ollama streaming timed out after {self.timeout}s",
+                provider="ollama",
+            ) from e
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -1182,7 +1257,7 @@ class OllamaProvider:
                         "stream": True,
                     },
                 )
-            raise
+            raise _translate_ollama_error(e) from e
 
     def _build_streaming_response(
         self,
@@ -1259,6 +1334,9 @@ class OllamaProvider:
             )
 
         # Extract usage from final chunk
+        # NOTE: reasoning_tokens is always None for Ollama because eval_count
+        # includes both reasoning and visible output tokens — Ollama does not
+        # report them separately.
         usage = Usage(
             input_tokens=final_chunk.get("prompt_eval_count", 0) if final_chunk else 0,
             output_tokens=final_chunk.get("eval_count", 0) if final_chunk else 0,
@@ -1607,6 +1685,9 @@ class OllamaProvider:
                 )
 
         # Build usage info
+        # NOTE: reasoning_tokens is always None for Ollama because eval_count
+        # includes both reasoning and visible output tokens — Ollama does not
+        # report them separately.
         usage = Usage(
             input_tokens=response.get("prompt_eval_count", 0),
             output_tokens=response.get("eval_count", 0),
