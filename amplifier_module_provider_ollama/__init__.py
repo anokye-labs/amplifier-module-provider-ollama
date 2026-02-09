@@ -13,18 +13,20 @@ import time
 from typing import Any
 from uuid import uuid4
 
-from amplifier_core import AuthenticationError  # pyright: ignore[reportAttributeAccessIssue]
 from amplifier_core import ConfigField
-from amplifier_core import ContentFilterError  # pyright: ignore[reportAttributeAccessIssue]
-from amplifier_core import ContextLengthError  # pyright: ignore[reportAttributeAccessIssue]
-from amplifier_core import InvalidRequestError  # pyright: ignore[reportAttributeAccessIssue]
-from amplifier_core import LLMError  # pyright: ignore[reportAttributeAccessIssue]
-from amplifier_core import LLMTimeoutError  # pyright: ignore[reportAttributeAccessIssue]
+from amplifier_core.llm_errors import (
+    AuthenticationError,
+    ContentFilterError,
+    ContextLengthError,
+    InvalidRequestError,
+    LLMError,
+    LLMTimeoutError,
+    ProviderUnavailableError,
+    RateLimitError,
+)
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ProviderInfo
-from amplifier_core import ProviderUnavailableError  # pyright: ignore[reportAttributeAccessIssue]
-from amplifier_core import RateLimitError  # pyright: ignore[reportAttributeAccessIssue]
 from amplifier_core import TextContent
 from amplifier_core import ThinkingContent
 from amplifier_core import ToolCallContent
@@ -544,6 +546,9 @@ class OllamaProvider:
                         f"Retrying in {delay}s..."
                     )
                     if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        # Event renamed from "ollama:retry" to "provider:retry" for
+                        # cross-provider consistency (Phase 2). Hooks subscribed to
+                        # "ollama:retry" need updating.
                         await self.coordinator.hooks.emit(
                             "provider:retry",
                             {
@@ -736,10 +741,9 @@ class OllamaProvider:
                 params["think"] = self.thinking_effort or True
                 include_thinking = True
             elif request.reasoning_effort is not None:
-                # Any non-None reasoning_effort enables thinking.
-                # Ollama thinking is binary (True) — effort levels are not
-                # supported via this path; use provider config for that.
-                params["think"] = True
+                # Ollama v0.9.0+ supports effort levels ("high", "medium", "low")
+                # via the `think` parameter — pass through directly.
+                params["think"] = request.reasoning_effort
                 include_thinking = True
             elif self.enable_thinking:
                 params["think"] = self.thinking_effort or True
@@ -1050,10 +1054,9 @@ class OllamaProvider:
                 params["think"] = self.thinking_effort or True
                 include_thinking = True
             elif request.reasoning_effort is not None:  # pyright: ignore[reportAttributeAccessIssue]
-                # Any non-None reasoning_effort enables thinking.
-                # Ollama thinking is binary (True) — effort levels are not
-                # supported via this path; use provider config for that.
-                params["think"] = True
+                # Ollama v0.9.0+ supports effort levels ("high", "medium", "low")
+                # via the `think` parameter — pass through directly.
+                params["think"] = request.reasoning_effort  # pyright: ignore[reportAttributeAccessIssue]
                 include_thinking = True
             elif self.enable_thinking:
                 params["think"] = self.thinking_effort or True

@@ -259,7 +259,7 @@ class TestReasoningEffort:
     """Verify reasoning_effort on ChatRequest enables thinking."""
 
     def test_reasoning_effort_enables_thinking_for_thinking_model(self):
-        """Non-None reasoning_effort should set think=True for capable models."""
+        """Non-None reasoning_effort should pass effort level to think param."""
         provider = _make_provider(
             default_model="deepseek-r1:14b", enable_thinking=False
         )
@@ -269,9 +269,10 @@ class TestReasoningEffort:
         asyncio.run(provider.complete(request, model="deepseek-r1:14b"))
 
         call_kwargs = provider.client.chat.call_args
+        # Ollama v0.9.0+ supports effort levels — value is passed through directly
         assert (
-            call_kwargs.kwargs.get("think") is True
-            or call_kwargs[1].get("think") is True
+            call_kwargs.kwargs.get("think") == "high"
+            or call_kwargs[1].get("think") == "high"
         )
 
     def test_reasoning_effort_ignored_for_non_thinking_model(self):
@@ -327,8 +328,8 @@ class TestReasoningEffort:
             or call_kwargs[1].get("think") == "high"
         )
 
-    def test_reasoning_effort_low_still_enables_thinking(self):
-        """Even 'low' reasoning_effort enables thinking (binary in Ollama)."""
+    def test_reasoning_effort_low_passes_through(self):
+        """'low' reasoning_effort is passed through as effort level."""
         provider = _make_provider(
             default_model="deepseek-r1:14b", enable_thinking=False
         )
@@ -338,13 +339,14 @@ class TestReasoningEffort:
         asyncio.run(provider.complete(request, model="deepseek-r1:14b"))
 
         call_kwargs = provider.client.chat.call_args
+        # Ollama v0.9.0+ supports effort levels — value is passed through directly
         assert (
-            call_kwargs.kwargs.get("think") is True
-            or call_kwargs[1].get("think") is True
+            call_kwargs.kwargs.get("think") == "low"
+            or call_kwargs[1].get("think") == "low"
         )
 
-    def test_streaming_reasoning_effort_enables_thinking(self):
-        """reasoning_effort should also work in streaming path."""
+    def test_streaming_reasoning_effort_passes_through(self):
+        """reasoning_effort should pass effort level through in streaming path."""
         provider = _make_provider(
             default_model="deepseek-r1:14b", enable_thinking=False
         )
@@ -366,7 +368,8 @@ class TestReasoningEffort:
         asyncio.run(provider.complete(request, model="deepseek-r1:14b"))
 
         call_kwargs = provider.client.chat.call_args
+        # Ollama v0.9.0+ supports effort levels — value is passed through directly
         assert (
-            call_kwargs.kwargs.get("think") is True
-            or call_kwargs[1].get("think") is True
+            call_kwargs.kwargs.get("think") == "high"
+            or call_kwargs[1].get("think") == "high"
         )
