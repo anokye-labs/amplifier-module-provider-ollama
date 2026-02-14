@@ -14,7 +14,9 @@ from typing import Any
 from uuid import uuid4
 
 from amplifier_core import ConfigField
+from amplifier_core.events import PROVIDER_RETRY
 from amplifier_core.llm_errors import (
+    AccessDeniedError,
     AuthenticationError,
     ContentFilterError,
     ContextLengthError,
@@ -24,6 +26,7 @@ from amplifier_core.llm_errors import (
     ProviderUnavailableError,
     RateLimitError,
 )
+from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ProviderInfo
@@ -109,8 +112,10 @@ def _translate_ollama_error(e: Exception) -> LLMError:  # pyright: ignore[report
     """
     if isinstance(e, ResponseError):
         status = getattr(e, "status_code", None)
-        if status in (401, 403):
+        if status == 401:
             return AuthenticationError(str(e), provider="ollama", status_code=status)  # pyright: ignore[reportReturnType]
+        if status == 403:
+            return AccessDeniedError(str(e), provider="ollama", status_code=status)  # pyright: ignore[reportReturnType]
         if status == 429:
             return RateLimitError(str(e), provider="ollama", status_code=429)  # pyright: ignore[reportReturnType]
         if status == 400:
@@ -257,6 +262,14 @@ class OllamaProvider:
         # Logprobs support (requires Ollama >= 0.12.11)
         self.logprobs: bool | None = self.config.get("logprobs")
         self.top_logprobs: int | None = self.config.get("top_logprobs")
+
+        # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
+        self._retry_config = RetryConfig(
+            max_retries=int(self.config.get("max_retries", 3)),
+            min_delay=float(self.config.get("min_retry_delay", 1.0)),
+            max_delay=float(self.config.get("max_retry_delay", 60.0)),
+            jitter=0.2,
+        )
 
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
@@ -510,59 +523,6 @@ class OllamaProvider:
         self._model_ctx_cache[model] = DEFAULT_CONTEXT_LENGTH
         return DEFAULT_CONTEXT_LENGTH
 
-    # ── Retry logic for transient connection errors ──────────────────────
-
-    MAX_RETRIES = 3
-    BASE_RETRY_DELAY = 1.0  # seconds
-
-    async def _retry_with_backoff(self, coro_factory, description: str = "API call"):
-        """Retry a coroutine with exponential backoff for transient errors.
-
-        Only retries on connection-level failures (server down, network timeout,
-        OS-level socket errors). API errors from Ollama (model not found, etc.)
-        are never retried.
-
-        Args:
-            coro_factory: Zero-arg callable that returns the awaitable to retry.
-            description: Human-readable label for logging/events.
-
-        Returns:
-            The result of the awaitable on success.
-
-        Raises:
-            The last transient error after all retries are exhausted,
-            or any ResponseError immediately.
-        """
-        last_error: Exception | None = None
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                return await coro_factory()
-            except (ConnectionError, TimeoutError, OSError) as e:
-                last_error = e
-                if attempt < self.MAX_RETRIES - 1:
-                    delay = self.BASE_RETRY_DELAY * (2**attempt)
-                    logger.warning(
-                        f"[PROVIDER] Ollama {description} failed (attempt {attempt + 1}/{self.MAX_RETRIES}): {e}. "
-                        f"Retrying in {delay}s..."
-                    )
-                    if self.coordinator and hasattr(self.coordinator, "hooks"):
-                        # Event renamed from "ollama:retry" to "provider:retry" for
-                        # cross-provider consistency (Phase 2). Hooks subscribed to
-                        # "ollama:retry" need updating.
-                        await self.coordinator.hooks.emit(
-                            "provider:retry",
-                            {
-                                "provider": self.name,
-                                "attempt": attempt + 1,
-                                "delay": delay,
-                                "error_type": type(e).__name__,
-                            },
-                        )
-                    await asyncio.sleep(delay)
-            except ResponseError:
-                raise  # Don't retry API errors (model not found, invalid params, etc.)
-        raise last_error  # type: ignore[misc]
-
     async def complete(self, request: ChatRequest, **kwargs) -> OllamaChatResponse:
         """
         Generate completion from ChatRequest.
@@ -791,102 +751,53 @@ class OllamaProvider:
 
         start_time = time.time()
 
-        # Call Ollama API with timeout and retry for transient errors
-        try:
-            raw_response = await self._retry_with_backoff(
-                lambda: asyncio.wait_for(
+        # Call Ollama API with shared retry_with_backoff from amplifier-core.
+        # Error translation happens inside _do_complete() so that retry_with_backoff
+        # sees LLMError (and checks retryable) rather than raw native exceptions.
+
+        async def _do_complete():
+            """Single API call attempt with native → kernel error translation."""
+            try:
+                return await asyncio.wait_for(
                     self.client.chat(**params), timeout=self.timeout
-                ),
-                description=f"chat completion ({model})",
-            )
-            # Convert Pydantic model to dict for consistent access
-            response = (
-                raw_response.model_dump()
-                if hasattr(raw_response, "model_dump")
-                else dict(raw_response)
-            )
-            elapsed_ms = int((time.time() - start_time) * 1000)
+                )
+            except LLMError:
+                raise  # Already a kernel error — pass through
+            except Exception as e:
+                raise _translate_ollama_error(e) from e
 
-            logger.info("[PROVIDER] Received response from Ollama API")
-
-            # Emit llm:response event
+        async def _on_retry(attempt: int, delay: float, error: LLMError):
+            """Callback invoked before each retry sleep."""
+            logger.warning(
+                "[PROVIDER] Ollama: transient error (attempt %d/%d, %s). "
+                "Waiting %.1fs before retry...",
+                attempt,
+                self._retry_config.max_retries,
+                type(error).__name__,
+                delay,
+            )
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                # Build usage info
-                usage_info = {}
-                if "prompt_eval_count" in response:
-                    usage_info["input"] = response.get("prompt_eval_count", 0)
-                if "eval_count" in response:
-                    usage_info["output"] = response.get("eval_count", 0)
-
-                # INFO level: Summary only
                 await self.coordinator.hooks.emit(
-                    "llm:response",
+                    PROVIDER_RETRY,
                     {
-                        "provider": "ollama",
-                        "model": model,
-                        "usage": usage_info,
-                        "status": "ok",
-                        "duration_ms": elapsed_ms,
+                        "provider": self.name,
+                        "attempt": attempt,
+                        "max_retries": self._retry_config.max_retries,
+                        "delay": delay,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
                     },
                 )
 
-                # DEBUG level: Truncated response (if debug enabled)
-                if self.debug:
-                    await self.coordinator.hooks.emit(
-                        "llm:response:debug",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "ollama",
-                            "response": _truncate_values(response),
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                        },
-                    )
-
-                # RAW level: Full response (if raw_debug enabled)
-                if self.raw_debug:
-                    await self.coordinator.hooks.emit(
-                        "llm:response:raw",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "ollama",
-                            "response": response,
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                        },
-                    )
-
-            # Convert to OllamaChatResponse
-            return self._convert_to_chat_response(
-                response, include_thinking=include_thinking
+        try:
+            raw_response = await retry_with_backoff(
+                _do_complete,
+                self._retry_config,
+                on_retry=_on_retry,
             )
-
-        except TimeoutError as e:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.error(f"[PROVIDER] Ollama API call timed out after {self.timeout}s")
-
-            # Emit timeout event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "ollama",
-                        "model": model,
-                        "status": "timeout",
-                        "duration_ms": elapsed_ms,
-                        "error": f"Request timed out after {self.timeout}s",
-                    },
-                )
-            raise LLMTimeoutError(
-                f"Ollama API call timed out after {self.timeout}s",
-                provider="ollama",
-            ) from e
-
-        except Exception as e:
+        except LLMError as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
             logger.error(f"[PROVIDER] Ollama API error: {e}")
-
-            # Emit error event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     "llm:response",
@@ -898,7 +809,70 @@ class OllamaProvider:
                         "error": str(e),
                     },
                 )
-            raise _translate_ollama_error(e) from e
+            raise
+
+        # Request succeeded — continue with response handling
+        # Convert Pydantic model to dict for consistent access
+        response = (
+            raw_response.model_dump()
+            if hasattr(raw_response, "model_dump")
+            else dict(raw_response)
+        )
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        logger.info("[PROVIDER] Received response from Ollama API")
+
+        # Emit llm:response event
+        if self.coordinator and hasattr(self.coordinator, "hooks"):
+            # Build usage info
+            usage_info = {}
+            if "prompt_eval_count" in response:
+                usage_info["input"] = response.get("prompt_eval_count", 0)
+            if "eval_count" in response:
+                usage_info["output"] = response.get("eval_count", 0)
+
+            # INFO level: Summary only
+            await self.coordinator.hooks.emit(
+                "llm:response",
+                {
+                    "provider": "ollama",
+                    "model": model,
+                    "usage": usage_info,
+                    "status": "ok",
+                    "duration_ms": elapsed_ms,
+                },
+            )
+
+            # DEBUG level: Truncated response (if debug enabled)
+            if self.debug:
+                await self.coordinator.hooks.emit(
+                    "llm:response:debug",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "ollama",
+                        "response": _truncate_values(response),
+                        "status": "ok",
+                        "duration_ms": elapsed_ms,
+                    },
+                )
+
+            # RAW level: Full response (if raw_debug enabled)
+            if self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:response:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "ollama",
+                        "response": response,
+                        "status": "ok",
+                        "duration_ms": elapsed_ms,
+                    },
+                )
+
+        # Convert to OllamaChatResponse
+        return self._convert_to_chat_response(
+            response, include_thinking=include_thinking
+        )
 
     async def _complete_streaming(
         self, request: ChatRequest, **kwargs
@@ -1111,13 +1085,51 @@ class OllamaProvider:
         accumulated_tool_calls: list[dict[str, Any]] = []
         final_chunk: dict[str, Any] | None = None
 
-        try:
-            async for chunk in await self._retry_with_backoff(
-                lambda: asyncio.wait_for(
+        # Use shared retry_with_backoff for the initial connection (streaming start).
+        # Error translation happens inside _do_start_stream so retry_with_backoff
+        # sees LLMError and can decide whether to retry.
+
+        async def _do_start_stream():
+            """Start the streaming call with error translation."""
+            try:
+                return await asyncio.wait_for(
                     self.client.chat(**params), timeout=self.timeout
-                ),
-                description=f"streaming chat ({model})",
-            ):
+                )
+            except LLMError:
+                raise
+            except Exception as e:
+                raise _translate_ollama_error(e) from e
+
+        async def _on_retry(attempt: int, delay: float, error: LLMError):
+            logger.warning(
+                "[PROVIDER] Ollama streaming: transient error (attempt %d/%d, %s). "
+                "Waiting %.1fs before retry...",
+                attempt,
+                self._retry_config.max_retries,
+                type(error).__name__,
+                delay,
+            )
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    PROVIDER_RETRY,
+                    {
+                        "provider": self.name,
+                        "attempt": attempt,
+                        "max_retries": self._retry_config.max_retries,
+                        "delay": delay,
+                        "error_type": type(error).__name__,
+                        "stream": True,
+                    },
+                )
+
+        try:
+            stream_iter = await retry_with_backoff(
+                _do_start_stream,
+                self._retry_config,
+                on_retry=_on_retry,
+            )
+
+            async for chunk in stream_iter:
                 message = chunk.get("message", {})
 
                 # Handle content chunks
@@ -1221,9 +1233,9 @@ class OllamaProvider:
                 include_thinking,
             )
 
-        except TimeoutError as e:
+        except LLMError as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.error(f"[PROVIDER] Streaming timed out after {self.timeout}s")
+            logger.error(f"[PROVIDER] Streaming error: {e}")
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
@@ -1231,15 +1243,13 @@ class OllamaProvider:
                     {
                         "provider": "ollama",
                         "model": model,
-                        "status": "timeout",
+                        "status": "error",
                         "duration_ms": elapsed_ms,
+                        "error": str(e),
                         "stream": True,
                     },
                 )
-            raise LLMTimeoutError(
-                f"Ollama streaming timed out after {self.timeout}s",
-                provider="ollama",
-            ) from e
+            raise
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
