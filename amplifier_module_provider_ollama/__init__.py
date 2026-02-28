@@ -21,6 +21,7 @@ from amplifier_core.llm_errors import (
     InvalidRequestError,
     LLMError,
     LLMTimeoutError,
+    NotFoundError,
     ProviderUnavailableError,
     RateLimitError,
 )
@@ -124,6 +125,8 @@ def _translate_ollama_error(e: Exception) -> LLMError:  # pyright: ignore[report
             if "content filter" in msg or "safety" in msg or "blocked" in msg:
                 return ContentFilterError(str(e), provider="ollama", status_code=400)  # pyright: ignore[reportReturnType]
             return InvalidRequestError(str(e), provider="ollama", status_code=status)  # pyright: ignore[reportReturnType]
+        if status == 404:
+            return NotFoundError(str(e), provider="ollama", status_code=404)  # pyright: ignore[reportReturnType]
         if status is not None and 500 <= status < 600:
             return ProviderUnavailableError(
                 str(e), provider="ollama", status_code=status

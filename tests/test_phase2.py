@@ -12,6 +12,7 @@ from amplifier_core import (
     InvalidRequestError,
     LLMError,
     LLMTimeoutError,
+    NotFoundError,
     ProviderUnavailableError,
     RateLimitError,
 )
@@ -117,6 +118,21 @@ class TestTranslateOllamaError:
         assert result.provider == "ollama"
         assert result.status_code == 400
 
+    def test_response_error_404(self):
+        err = ResponseError("model not found")
+        err.status_code = 404
+        result = _translate_ollama_error(err)
+        assert isinstance(result, NotFoundError)
+        assert result.provider == "ollama"
+        assert result.status_code == 404
+        assert result.retryable is False
+
+    def test_response_error_404_is_not_retryable(self):
+        err = ResponseError("not found")
+        err.status_code = 404
+        result = _translate_ollama_error(err)
+        assert result.retryable is False
+
     def test_response_error_500(self):
         err = ResponseError("internal server error")
         err.status_code = 500
@@ -210,6 +226,19 @@ class TestErrorTranslationIntegration:
             asyncio.run(provider.complete(_simple_request()))
 
         assert exc_info.value.status_code == 500
+
+    def test_response_error_404_raises_not_found(self):
+        provider = _make_provider()
+        err = ResponseError("model not found")
+        err.status_code = 404
+        provider.client.chat = AsyncMock(side_effect=err)
+
+        with pytest.raises(NotFoundError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+
+        assert exc_info.value.status_code == 404
+        assert exc_info.value.retryable is False
+        assert exc_info.value.__cause__ is err
 
     def test_connection_error_after_retry_raises_provider_unavailable(self):
         """ConnectionError is retried by _retry_with_backoff, then translated."""
