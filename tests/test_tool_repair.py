@@ -45,7 +45,9 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
     messages = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_1", name="do_something", input={"value": 1})],
+            content=[
+                ToolCallBlock(id="call_1", name="do_something", input={"value": 1})
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -57,10 +59,17 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
     provider.client.chat.assert_awaited_once()
 
     # Should not emit validation error
-    assert all(event_name != "provider:validation_error" for event_name, _ in fake_coordinator.hooks.events)
+    assert all(
+        event_name != "provider:validation_error"
+        for event_name, _ in fake_coordinator.hooks.events
+    )
 
     # Should emit repair event
-    repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events) == 1
     assert repair_events[0][1]["provider"] == "ollama"
     assert repair_events[0][1]["repair_count"] == 1
@@ -87,7 +96,9 @@ def test_repaired_tool_ids_are_not_detected_again():
     messages = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})],
+            content=[
+                ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -98,7 +109,11 @@ def test_repaired_tool_ids_are_not_detected_again():
 
     # Verify repair happened
     assert "call_abc123" in provider._repaired_tool_ids  # pyright: ignore[reportAttributeAccessIssue]
-    repair_events_1 = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events_1 = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events_1) == 1
 
     # Clear events for second call
@@ -109,7 +124,9 @@ def test_repaired_tool_ids_are_not_detected_again():
     messages_2 = [
         Message(
             role="assistant",
-            content=[ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})],
+            content=[
+                ToolCallBlock(id="call_abc123", name="grep", input={"pattern": "test"})
+            ],
         ),
         Message(role="user", content="No tool result present"),
     ]
@@ -118,7 +135,11 @@ def test_repaired_tool_ids_are_not_detected_again():
     asyncio.run(provider.complete(request_2))
 
     # Should NOT emit another repair event for the same tool ID
-    repair_events_2 = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events_2 = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events_2) == 0, "Should not re-detect already-repaired tool IDs"
 
 
@@ -149,6 +170,10 @@ def test_multiple_missing_tool_results_all_tracked():
     assert provider._repaired_tool_ids == {"call_1", "call_2", "call_3"}  # pyright: ignore[reportAttributeAccessIssue]
 
     # Verify repair event has all 3
-    repair_events = [e for e in fake_coordinator.hooks.events if e[0] == "provider:tool_sequence_repaired"]
+    repair_events = [
+        e
+        for e in fake_coordinator.hooks.events
+        if e[0] == "provider:tool_sequence_repaired"
+    ]
     assert len(repair_events) == 1
     assert repair_events[0][1]["repair_count"] == 3
