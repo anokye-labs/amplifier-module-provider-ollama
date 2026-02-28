@@ -102,8 +102,9 @@ def _truncate_values(
 def _translate_ollama_error(e: Exception) -> LLMError:  # pyright: ignore[reportReturnType]
     """Translate native Ollama/connection errors to kernel LLM error types.
 
-    Called inside _do_complete() so that retry_with_backoff sees LLMError
-    subclasses and can check .retryable to decide whether to retry.
+    Called inside _do_complete() / _do_stream_connect() so that
+    retry_with_backoff sees LLMError subclasses and can check .retryable
+    to decide whether to retry.
     5xx errors become ProviderUnavailableError(retryable=True), while
     4xx errors become non-retryable errors that raise immediately.
 
@@ -532,59 +533,6 @@ class OllamaProvider:
         # Default fallback
         self._model_ctx_cache[model] = DEFAULT_CONTEXT_LENGTH
         return DEFAULT_CONTEXT_LENGTH
-
-    # ── Retry logic for transient connection errors ──────────────────────
-
-    MAX_RETRIES = 3
-    BASE_RETRY_DELAY = 1.0  # seconds
-
-    async def _retry_with_backoff(self, coro_factory, description: str = "API call"):
-        """Retry a coroutine with exponential backoff for transient errors.
-
-        Only retries on connection-level failures (server down, network timeout,
-        OS-level socket errors). API errors from Ollama (model not found, etc.)
-        are never retried.
-
-        Args:
-            coro_factory: Zero-arg callable that returns the awaitable to retry.
-            description: Human-readable label for logging/events.
-
-        Returns:
-            The result of the awaitable on success.
-
-        Raises:
-            The last transient error after all retries are exhausted,
-            or any ResponseError immediately.
-        """
-        last_error: Exception | None = None
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                return await coro_factory()
-            except (ConnectionError, TimeoutError, OSError) as e:
-                last_error = e
-                if attempt < self.MAX_RETRIES - 1:
-                    delay = self.BASE_RETRY_DELAY * (2**attempt)
-                    logger.warning(
-                        f"[PROVIDER] Ollama {description} failed (attempt {attempt + 1}/{self.MAX_RETRIES}): {e}. "
-                        f"Retrying in {delay}s..."
-                    )
-                    if self.coordinator and hasattr(self.coordinator, "hooks"):
-                        # Event renamed from "ollama:retry" to "provider:retry" for
-                        # cross-provider consistency (Phase 2). Hooks subscribed to
-                        # "ollama:retry" need updating.
-                        await self.coordinator.hooks.emit(
-                            "provider:retry",
-                            {
-                                "provider": self.name,
-                                "attempt": attempt + 1,
-                                "delay": delay,
-                                "error_type": type(e).__name__,
-                            },
-                        )
-                    await asyncio.sleep(delay)
-            except ResponseError:
-                raise  # Don't retry API errors (model not found, invalid params, etc.)
-        raise last_error  # type: ignore[misc]
 
     async def complete(self, request: ChatRequest, **kwargs) -> OllamaChatResponse:
         """
@@ -1171,13 +1119,56 @@ class OllamaProvider:
         accumulated_tool_calls: list[dict[str, Any]] = []
         final_chunk: dict[str, Any] | None = None
 
-        try:
-            async for chunk in await self._retry_with_backoff(
-                lambda: asyncio.wait_for(
+        # Inner function: wraps the initial stream connection with error
+        # translation so that retry_with_backoff sees LLMError subclasses and
+        # can check .retryable to decide whether to retry.
+        async def _do_stream_connect():
+            try:
+                return await asyncio.wait_for(
                     self.client.chat(**params), timeout=self.timeout
-                ),
-                description=f"streaming chat ({model})",
-            ):
+                )
+            except ResponseError as e:
+                raise _translate_ollama_error(e) from e
+            except (asyncio.TimeoutError, TimeoutError) as e:
+                raise LLMTimeoutError(
+                    str(e) or f"Request timed out after {self.timeout}s",
+                    provider="ollama",
+                    retryable=True,
+                ) from e
+            except (ConnectionError, OSError) as e:
+                raise ProviderUnavailableError(
+                    str(e), provider="ollama", retryable=True
+                ) from e
+            except LLMError:
+                raise
+            except Exception as e:
+                raise _translate_ollama_error(e) from e
+
+        # Callback for retry events — signature matches amplifier-core's
+        # retry_with_backoff on_retry contract: (attempt, delay, error)
+        async def _on_retry(attempt: int, delay: float, error: LLMError) -> None:
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "provider:retry",
+                    {
+                        "provider": self.name,
+                        "attempt": attempt,
+                        "max_retries": self._retry_config.max_retries,
+                        "delay": delay,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    },
+                )
+
+        try:
+            # Retry covers the initial stream connection only.
+            stream = await retry_with_backoff(
+                _do_stream_connect, self._retry_config, on_retry=_on_retry
+            )
+
+            # Mid-stream errors are NOT retried — they fall through to
+            # the outer except blocks below.
+            async for chunk in stream:
                 message = chunk.get("message", {})
 
                 # Handle content chunks
@@ -1281,9 +1272,9 @@ class OllamaProvider:
                 include_thinking,
             )
 
-        except TimeoutError as e:
+        except LLMError as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.error(f"[PROVIDER] Streaming timed out after {self.timeout}s")
+            logger.error(f"[PROVIDER] Streaming error: {e}")
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
@@ -1291,16 +1282,15 @@ class OllamaProvider:
                     {
                         "provider": "ollama",
                         "model": model,
-                        "status": "timeout",
+                        "status": "timeout"
+                        if isinstance(e, LLMTimeoutError)
+                        else "error",
                         "duration_ms": elapsed_ms,
+                        "error": str(e),
                         "stream": True,
                     },
                 )
-            raise LLMTimeoutError(
-                f"Ollama streaming timed out after {self.timeout}s",
-                provider="ollama",
-                retryable=True,
-            ) from e
+            raise
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)

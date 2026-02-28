@@ -58,7 +58,6 @@ class TestRetryConfigAttribute:
 # ── TestOldRetryCodeRemoved ─────────────────────────────────────────────
 
 
-@pytest.mark.xfail(reason="Old retry code removed in Task 4", strict=True)
 class TestOldRetryCodeRemoved:
     """Verify that legacy retry constants and methods are removed."""
 
@@ -233,3 +232,115 @@ class TestRetryEventEmission:
 
         attempts = [p["attempt"] for _, p in retry_events]
         assert attempts == [1, 2, 3]
+
+
+# ── TestStreamingRetryBehavior ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestStreamingRetryBehavior:
+    """Verify retry behavior through the streaming complete() path."""
+
+    async def test_streaming_5xx_is_retried(self, make_provider, simple_request):
+        """500 errors on stream connection should be retried."""
+        provider = make_provider(max_retries=2)
+        err = ResponseError("internal server error")
+        err.status_code = 500
+
+        async def fake_stream():
+            yield {"message": {"content": "ok"}, "done": False}
+            yield {
+                "message": {"content": ""},
+                "done": True,
+                "prompt_eval_count": 5,
+                "eval_count": 2,
+                "model": "llama3.2:3b",
+            }
+
+        provider.client.chat = AsyncMock(side_effect=[err, fake_stream()])
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await provider.complete(simple_request(stream=True))
+
+        assert result is not None
+        assert provider.client.chat.await_count == 2
+
+    async def test_streaming_connection_error_is_retried(
+        self, make_provider, simple_request
+    ):
+        """ConnectionError on stream connection should be retried."""
+        provider = make_provider(max_retries=2)
+
+        async def fake_stream():
+            yield {"message": {"content": "ok"}, "done": False}
+            yield {
+                "message": {"content": ""},
+                "done": True,
+                "prompt_eval_count": 5,
+                "eval_count": 2,
+                "model": "llama3.2:3b",
+            }
+
+        provider.client.chat = AsyncMock(
+            side_effect=[ConnectionError("refused"), fake_stream()]
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await provider.complete(simple_request(stream=True))
+
+        assert result is not None
+        assert provider.client.chat.await_count == 2
+
+    async def test_streaming_404_not_retried(self, make_provider, simple_request):
+        """404 errors on stream connection should NOT be retried."""
+        provider = make_provider(max_retries=3)
+        err = ResponseError("model not found")
+        err.status_code = 404
+        provider.client.chat = AsyncMock(side_effect=err)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(NotFoundError):
+                await provider.complete(simple_request(stream=True))
+
+        assert provider.client.chat.await_count == 1
+
+
+# ── TestStreamingRetryEventEmission ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestStreamingRetryEventEmission:
+    """Verify that streaming path emits provider:retry events via _on_retry."""
+
+    async def test_streaming_retry_event_emitted(self, make_provider, simple_request):
+        """A single streaming retry should emit one provider:retry event."""
+        provider = make_provider(max_retries=2)
+        err = ResponseError("internal server error")
+        err.status_code = 500
+
+        async def fake_stream():
+            yield {"message": {"content": "ok"}, "done": False}
+            yield {
+                "message": {"content": ""},
+                "done": True,
+                "prompt_eval_count": 5,
+                "eval_count": 2,
+                "model": "llama3.2:3b",
+            }
+
+        provider.client.chat = AsyncMock(side_effect=[err, fake_stream()])
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await provider.complete(simple_request(stream=True))
+
+        hooks = provider.coordinator.hooks  # type: ignore[union-attr]
+        retry_events = [(n, p) for n, p in hooks.events if n == "provider:retry"]
+        assert len(retry_events) == 1
+
+        _, payload = retry_events[0]
+        assert payload["provider"] == "ollama"
+        assert payload["attempt"] == 1
+        assert payload["max_retries"] == 2
+        assert "delay" in payload
+        assert payload["error_type"] == "ProviderUnavailableError"
+        assert "error_message" in payload
