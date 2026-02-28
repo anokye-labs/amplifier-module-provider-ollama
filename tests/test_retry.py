@@ -311,3 +311,7 @@ class TestStreamingRetryBehavior:
         _, payload = retry_events[0]
         assert payload["provider"] == "ollama"
         assert payload["attempt"] == 1
+        assert payload["max_retries"] == 2
+        assert "delay" in payload
+        assert payload["error_type"] == "ProviderUnavailableError"
+        assert "error_message" in payload
