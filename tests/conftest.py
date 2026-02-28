@@ -10,7 +10,7 @@ The amplifier-core pytest plugin provides fixtures automatically:
 - provider_module, tool_module, etc.: Mounted module instances
 """
 
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from amplifier_core import ModuleCoordinator
@@ -23,9 +23,9 @@ class FakeHooks:
     """Minimal hooks implementation that records emitted events."""
 
     def __init__(self):
-        self.events: list[tuple[str, dict]] = []
+        self.events: list[tuple[str, dict[str, Any]]] = []
 
-    async def emit(self, name: str, payload: dict) -> None:
+    async def emit(self, name: str, payload: dict[str, Any]) -> None:
         self.events.append((name, payload))
 
 

@@ -839,7 +839,8 @@ class OllamaProvider:
             except Exception as e:
                 raise _translate_ollama_error(e) from e
 
-        # Callback for retry events
+        # Callback for retry events — signature matches amplifier-core's
+        # retry_with_backoff on_retry contract: (attempt, delay, error)
         async def _on_retry(attempt: int, delay: float, error: LLMError) -> None:
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
