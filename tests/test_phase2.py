@@ -2,7 +2,7 @@
 
 import asyncio
 from typing import cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from amplifier_core import (
@@ -195,8 +195,9 @@ class TestErrorTranslationIntegration:
         provider = _make_provider()
         provider.client.chat = AsyncMock(side_effect=asyncio.TimeoutError())
 
-        with pytest.raises(LLMTimeoutError) as exc_info:
-            asyncio.run(provider.complete(_simple_request()))
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(LLMTimeoutError) as exc_info:
+                asyncio.run(provider.complete(_simple_request()))
 
         assert exc_info.value.provider == "ollama"
         assert exc_info.value.__cause__ is not None
@@ -205,8 +206,9 @@ class TestErrorTranslationIntegration:
         provider = _make_provider()
         provider.client.chat = AsyncMock(side_effect=asyncio.TimeoutError())
 
-        with pytest.raises(LLMTimeoutError) as exc_info:
-            asyncio.run(provider.complete(_simple_request()))
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(LLMTimeoutError) as exc_info:
+                asyncio.run(provider.complete(_simple_request()))
 
         assert exc_info.value.retryable is True
 
@@ -237,8 +239,9 @@ class TestErrorTranslationIntegration:
         err.status_code = 500
         provider.client.chat = AsyncMock(side_effect=err)
 
-        with pytest.raises(ProviderUnavailableError) as exc_info:
-            asyncio.run(provider.complete(_simple_request()))
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(ProviderUnavailableError) as exc_info:
+                asyncio.run(provider.complete(_simple_request()))
 
         assert exc_info.value.status_code == 500
 
@@ -256,13 +259,14 @@ class TestErrorTranslationIntegration:
         assert exc_info.value.__cause__ is err
 
     def test_connection_error_after_retry_raises_provider_unavailable(self):
-        """ConnectionError is retried by _retry_with_backoff, then translated."""
+        """ConnectionError is retried by retry_with_backoff, then translated."""
         provider = _make_provider()
-        # _retry_with_backoff retries 3 times; all fail → raises last error
+        # retry_with_backoff retries 3 times; all fail → raises last error
         provider.client.chat = AsyncMock(side_effect=ConnectionError("refused"))
 
-        with pytest.raises(ProviderUnavailableError) as exc_info:
-            asyncio.run(provider.complete(_simple_request()))
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(ProviderUnavailableError) as exc_info:
+                asyncio.run(provider.complete(_simple_request()))
 
         assert exc_info.value.retryable is True
 
@@ -281,8 +285,9 @@ class TestErrorTranslationIntegration:
         provider = _make_provider()
         provider.client.chat = AsyncMock(side_effect=asyncio.TimeoutError())
 
-        with pytest.raises(LLMTimeoutError) as exc_info:
-            asyncio.run(provider.complete(_simple_request(stream=True)))
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(LLMTimeoutError) as exc_info:
+                asyncio.run(provider.complete(_simple_request(stream=True)))
 
         assert exc_info.value.provider == "ollama"
 
