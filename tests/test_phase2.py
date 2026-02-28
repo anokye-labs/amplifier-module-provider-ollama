@@ -1,7 +1,6 @@
 """Tests for Phase 2: error translation, reasoning_effort, and usage notes."""
 
 import asyncio
-from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -16,52 +15,9 @@ from amplifier_core import (
     ProviderUnavailableError,
     RateLimitError,
 )
-from amplifier_core import ModuleCoordinator
-from amplifier_core.message_models import ChatRequest, Message
 from ollama import ResponseError  # pyright: ignore[reportAttributeAccessIssue]
 
-from amplifier_module_provider_ollama import OllamaProvider, _translate_ollama_error
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────
-
-
-class FakeHooks:
-    def __init__(self):
-        self.events: list[tuple[str, dict]] = []
-
-    async def emit(self, name: str, payload: dict) -> None:
-        self.events.append((name, payload))
-
-
-class FakeCoordinator:
-    def __init__(self):
-        self.hooks = FakeHooks()
-
-
-def _make_provider(**overrides) -> OllamaProvider:
-    """Create a provider wired to a FakeCoordinator with chat mocked out."""
-    provider = OllamaProvider(host="http://localhost:11434", config=overrides)
-    provider.coordinator = cast(ModuleCoordinator, FakeCoordinator())
-    return provider
-
-
-def _simple_request(**kwargs) -> ChatRequest:
-    return ChatRequest(
-        messages=[Message(role="user", content="hello")],
-        **kwargs,
-    )
-
-
-def _mock_response(content: str = "ok"):
-    """Minimal successful Ollama response dict."""
-    return {
-        "message": {"role": "assistant", "content": content},
-        "done": True,
-        "model": "llama3.2:3b",
-        "prompt_eval_count": 10,
-        "eval_count": 5,
-    }
+from amplifier_module_provider_ollama import _translate_ollama_error
 
 
 # ── _translate_ollama_error unit tests ───────────────────────────────────
@@ -188,134 +144,154 @@ class TestTranslateOllamaError:
 # ── Error translation integration (through complete()) ──────────────────
 
 
+@pytest.mark.asyncio
 class TestErrorTranslationIntegration:
     """Verify that complete() raises translated kernel errors."""
 
-    def test_timeout_raises_llm_timeout_error(self):
-        provider = _make_provider()
+    async def test_timeout_raises_llm_timeout_error(
+        self, make_provider, simple_request
+    ):
+        provider = make_provider()
         provider.client.chat = AsyncMock(side_effect=asyncio.TimeoutError())
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(LLMTimeoutError) as exc_info:
-                asyncio.run(provider.complete(_simple_request()))
+                await provider.complete(simple_request())
 
         assert exc_info.value.provider == "ollama"
         assert exc_info.value.__cause__ is not None
 
-    def test_timeout_error_is_retryable_through_complete(self):
-        provider = _make_provider()
+    async def test_timeout_error_is_retryable_through_complete(
+        self, make_provider, simple_request
+    ):
+        provider = make_provider()
         provider.client.chat = AsyncMock(side_effect=asyncio.TimeoutError())
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(LLMTimeoutError) as exc_info:
-                asyncio.run(provider.complete(_simple_request()))
+                await provider.complete(simple_request())
 
         assert exc_info.value.retryable is True
 
-    def test_response_error_401_raises_authentication_error(self):
-        provider = _make_provider()
+    async def test_response_error_401_raises_authentication_error(
+        self, make_provider, simple_request
+    ):
+        provider = make_provider()
         err = ResponseError("unauthorized")
         err.status_code = 401
         provider.client.chat = AsyncMock(side_effect=err)
 
         with pytest.raises(AuthenticationError) as exc_info:
-            asyncio.run(provider.complete(_simple_request()))
+            await provider.complete(simple_request())
 
         assert exc_info.value.provider == "ollama"
         assert exc_info.value.__cause__ is err
 
-    def test_response_error_400_raises_invalid_request(self):
-        provider = _make_provider()
+    async def test_response_error_400_raises_invalid_request(
+        self, make_provider, simple_request
+    ):
+        provider = make_provider()
         err = ResponseError("bad request")
         err.status_code = 400
         provider.client.chat = AsyncMock(side_effect=err)
 
         with pytest.raises(InvalidRequestError):
-            asyncio.run(provider.complete(_simple_request()))
+            await provider.complete(simple_request())
 
-    def test_response_error_500_raises_provider_unavailable(self):
-        provider = _make_provider()
+    async def test_response_error_500_raises_provider_unavailable(
+        self, make_provider, simple_request
+    ):
+        provider = make_provider()
         err = ResponseError("server error")
         err.status_code = 500
         provider.client.chat = AsyncMock(side_effect=err)
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(ProviderUnavailableError) as exc_info:
-                asyncio.run(provider.complete(_simple_request()))
+                await provider.complete(simple_request())
 
         assert exc_info.value.status_code == 500
 
-    def test_response_error_404_raises_not_found(self):
-        provider = _make_provider()
+    async def test_response_error_404_raises_not_found(
+        self, make_provider, simple_request
+    ):
+        provider = make_provider()
         err = ResponseError("model not found")
         err.status_code = 404
         provider.client.chat = AsyncMock(side_effect=err)
 
         with pytest.raises(NotFoundError) as exc_info:
-            asyncio.run(provider.complete(_simple_request()))
+            await provider.complete(simple_request())
 
         assert exc_info.value.status_code == 404
         assert exc_info.value.retryable is False
         assert exc_info.value.__cause__ is err
 
-    def test_connection_error_after_retry_raises_provider_unavailable(self):
+    async def test_connection_error_after_retry_raises_provider_unavailable(
+        self, make_provider, simple_request
+    ):
         """ConnectionError is retried by retry_with_backoff, then translated."""
-        provider = _make_provider()
+        provider = make_provider()
         # retry_with_backoff retries 3 times; all fail → raises last error
         provider.client.chat = AsyncMock(side_effect=ConnectionError("refused"))
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(ProviderUnavailableError) as exc_info:
-                asyncio.run(provider.complete(_simple_request()))
+                await provider.complete(simple_request())
 
         assert exc_info.value.retryable is True
 
-    def test_cause_chain_preserved(self):
-        provider = _make_provider()
+    async def test_cause_chain_preserved(self, make_provider, simple_request):
+        provider = make_provider()
         original = ResponseError("original")
         original.status_code = 400
         provider.client.chat = AsyncMock(side_effect=original)
 
         with pytest.raises(InvalidRequestError) as exc_info:
-            asyncio.run(provider.complete(_simple_request()))
+            await provider.complete(simple_request())
 
         assert exc_info.value.__cause__ is original
 
-    def test_streaming_timeout_raises_llm_timeout_error(self):
-        provider = _make_provider()
+    async def test_streaming_timeout_raises_llm_timeout_error(
+        self, make_provider, simple_request
+    ):
+        provider = make_provider()
         provider.client.chat = AsyncMock(side_effect=asyncio.TimeoutError())
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(LLMTimeoutError) as exc_info:
-                asyncio.run(provider.complete(_simple_request(stream=True)))
+                await provider.complete(simple_request(stream=True))
 
         assert exc_info.value.provider == "ollama"
 
-    def test_streaming_response_error_raises_translated(self):
-        provider = _make_provider()
+    async def test_streaming_response_error_raises_translated(
+        self, make_provider, simple_request
+    ):
+        provider = make_provider()
         err = ResponseError("forbidden")
         err.status_code = 403
         provider.client.chat = AsyncMock(side_effect=err)
 
         with pytest.raises(AuthenticationError):
-            asyncio.run(provider.complete(_simple_request(stream=True)))
+            await provider.complete(simple_request(stream=True))
 
 
-# ── reasoning_effort support ─────────────────────────────────────────────
+# ── reasoning_effort support ────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 class TestReasoningEffort:
     """Verify reasoning_effort on ChatRequest enables thinking."""
 
-    def test_reasoning_effort_enables_thinking_for_thinking_model(self):
+    async def test_reasoning_effort_enables_thinking_for_thinking_model(
+        self, make_provider, simple_request, mock_response
+    ):
         """Non-None reasoning_effort should pass effort level to think param."""
-        provider = _make_provider(
-            default_model="deepseek-r1:14b", enable_thinking=False
-        )
-        provider.client.chat = AsyncMock(return_value=_mock_response())
+        provider = make_provider(default_model="deepseek-r1:14b", enable_thinking=False)
+        provider.client.chat = AsyncMock(return_value=mock_response())
 
-        request = _simple_request(reasoning_effort="high")
-        asyncio.run(provider.complete(request, model="deepseek-r1:14b"))
+        request = simple_request(reasoning_effort="high")
+        await provider.complete(request, model="deepseek-r1:14b")
 
         call_kwargs = provider.client.chat.call_args
         # Ollama v0.9.0+ supports effort levels — value is passed through directly
@@ -324,29 +300,33 @@ class TestReasoningEffort:
             or call_kwargs[1].get("think") == "high"
         )
 
-    def test_reasoning_effort_ignored_for_non_thinking_model(self):
+    async def test_reasoning_effort_ignored_for_non_thinking_model(
+        self, make_provider, simple_request, mock_response
+    ):
         """reasoning_effort should have no effect on non-thinking models."""
-        provider = _make_provider(default_model="llama3.2:3b", enable_thinking=False)
-        provider.client.chat = AsyncMock(return_value=_mock_response())
+        provider = make_provider(default_model="llama3.2:3b", enable_thinking=False)
+        provider.client.chat = AsyncMock(return_value=mock_response())
 
-        request = _simple_request(reasoning_effort="medium")
-        asyncio.run(provider.complete(request, model="llama3.2:3b"))
+        request = simple_request(reasoning_effort="medium")
+        await provider.complete(request, model="llama3.2:3b")
 
         call_kwargs = provider.client.chat.call_args
         # think should not be in the params at all
         assert "think" not in (call_kwargs.kwargs or {})
 
-    def test_reasoning_effort_none_falls_through_to_config(self):
+    async def test_reasoning_effort_none_falls_through_to_config(
+        self, make_provider, simple_request, mock_response
+    ):
         """When reasoning_effort is None, existing config controls thinking."""
-        provider = _make_provider(
+        provider = make_provider(
             default_model="qwen3:8b",
             enable_thinking=True,
             thinking_effort="low",
         )
-        provider.client.chat = AsyncMock(return_value=_mock_response())
+        provider.client.chat = AsyncMock(return_value=mock_response())
 
-        request = _simple_request()  # reasoning_effort defaults to None
-        asyncio.run(provider.complete(request, model="qwen3:8b"))
+        request = simple_request()  # reasoning_effort defaults to None
+        await provider.complete(request, model="qwen3:8b")
 
         call_kwargs = provider.client.chat.call_args
         # Should use config effort "low" (not True from reasoning_effort)
@@ -355,20 +335,22 @@ class TestReasoningEffort:
             or call_kwargs[1].get("think") == "low"
         )
 
-    def test_enable_thinking_takes_precedence_over_reasoning_effort(self):
+    async def test_enable_thinking_takes_precedence_over_reasoning_effort(
+        self, make_provider, simple_request, mock_response
+    ):
         """request.enable_thinking (kwargs path) has higher priority."""
-        provider = _make_provider(
+        provider = make_provider(
             default_model="qwen3:8b",
             enable_thinking=False,
             thinking_effort="high",
         )
-        provider.client.chat = AsyncMock(return_value=_mock_response())
+        provider.client.chat = AsyncMock(return_value=mock_response())
 
         # Simulate enable_thinking on request (existing kwargs path)
-        request = _simple_request(reasoning_effort="medium")
+        request = simple_request(reasoning_effort="medium")
         # Manually set enable_thinking to test precedence
         request.enable_thinking = True  # type: ignore[attr-defined]
-        asyncio.run(provider.complete(request, model="qwen3:8b"))
+        await provider.complete(request, model="qwen3:8b")
 
         call_kwargs = provider.client.chat.call_args
         # Should use config's thinking_effort "high" (from enable_thinking path)
@@ -377,15 +359,15 @@ class TestReasoningEffort:
             or call_kwargs[1].get("think") == "high"
         )
 
-    def test_reasoning_effort_low_passes_through(self):
+    async def test_reasoning_effort_low_passes_through(
+        self, make_provider, simple_request, mock_response
+    ):
         """'low' reasoning_effort is passed through as effort level."""
-        provider = _make_provider(
-            default_model="deepseek-r1:14b", enable_thinking=False
-        )
-        provider.client.chat = AsyncMock(return_value=_mock_response())
+        provider = make_provider(default_model="deepseek-r1:14b", enable_thinking=False)
+        provider.client.chat = AsyncMock(return_value=mock_response())
 
-        request = _simple_request(reasoning_effort="low")
-        asyncio.run(provider.complete(request, model="deepseek-r1:14b"))
+        request = simple_request(reasoning_effort="low")
+        await provider.complete(request, model="deepseek-r1:14b")
 
         call_kwargs = provider.client.chat.call_args
         # Ollama v0.9.0+ supports effort levels — value is passed through directly
@@ -394,11 +376,11 @@ class TestReasoningEffort:
             or call_kwargs[1].get("think") == "low"
         )
 
-    def test_streaming_reasoning_effort_passes_through(self):
+    async def test_streaming_reasoning_effort_passes_through(
+        self, make_provider, simple_request
+    ):
         """reasoning_effort should pass effort level through in streaming path."""
-        provider = _make_provider(
-            default_model="deepseek-r1:14b", enable_thinking=False
-        )
+        provider = make_provider(default_model="deepseek-r1:14b", enable_thinking=False)
 
         # Create an async iterator for streaming
         async def fake_stream():
@@ -413,8 +395,8 @@ class TestReasoningEffort:
 
         provider.client.chat = AsyncMock(return_value=fake_stream())
 
-        request = _simple_request(stream=True, reasoning_effort="high")
-        asyncio.run(provider.complete(request, model="deepseek-r1:14b"))
+        request = simple_request(stream=True, reasoning_effort="high")
+        await provider.complete(request, model="deepseek-r1:14b")
 
         call_kwargs = provider.client.chat.call_args
         # Ollama v0.9.0+ supports effort levels — value is passed through directly
