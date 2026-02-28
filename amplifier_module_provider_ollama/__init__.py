@@ -102,9 +102,10 @@ def _truncate_values(
 def _translate_ollama_error(e: Exception) -> LLMError:  # pyright: ignore[reportReturnType]
     """Translate native Ollama/connection errors to kernel LLM error types.
 
-    Called at the OUTER level after ``_retry_with_backoff`` has exhausted
-    retries for transient connection errors.  ``ResponseError`` passes
-    through retry immediately (never retried).
+    Called inside _do_complete() so that retry_with_backoff sees LLMError
+    subclasses and can check .retryable to decide whether to retry.
+    5xx errors become ProviderUnavailableError(retryable=True), while
+    4xx errors become non-retryable errors that raise immediately.
 
     The returned exception should be raised with ``raise ... from e`` to
     preserve the original ``__cause__``.

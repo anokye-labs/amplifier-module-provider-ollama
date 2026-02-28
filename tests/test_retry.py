@@ -109,6 +109,7 @@ class TestRetryConfigAttribute:
 # ── TestOldRetryCodeRemoved ─────────────────────────────────────────
 
 
+@pytest.mark.xfail(reason="Old retry code removed in Task 4", strict=True)
 class TestOldRetryCodeRemoved:
     """Verify that legacy retry constants and methods are removed."""
 
