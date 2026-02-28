@@ -113,7 +113,11 @@ def _translate_ollama_error(e: Exception) -> LLMError:  # pyright: ignore[report
         if status in (401, 403):
             return AuthenticationError(str(e), provider="ollama", status_code=status)  # pyright: ignore[reportReturnType]
         if status == 429:
-            return RateLimitError(str(e), provider="ollama", status_code=429)  # pyright: ignore[reportReturnType]
+            # Note: ollama SDK's ResponseError doesn't expose HTTP headers,
+            # so retry_after cannot be extracted from the response.
+            return RateLimitError(
+                str(e), provider="ollama", status_code=429, retryable=True
+            )  # pyright: ignore[reportReturnType]
         if status == 400:
             msg = str(e).lower()
             if (
@@ -135,7 +139,7 @@ def _translate_ollama_error(e: Exception) -> LLMError:  # pyright: ignore[report
     # TimeoutError is a subclass of OSError in Python 3.11+, so check it
     # *before* the broader (ConnectionError, OSError) catch.
     if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
-        return LLMTimeoutError(str(e), provider="ollama")  # pyright: ignore[reportReturnType]
+        return LLMTimeoutError(str(e), provider="ollama", retryable=True)  # pyright: ignore[reportReturnType]
     if isinstance(e, (ConnectionError, OSError)):
         return ProviderUnavailableError(str(e), provider="ollama", retryable=True)  # pyright: ignore[reportReturnType]
     return LLMError(str(e), provider="ollama", retryable=True)
@@ -883,6 +887,7 @@ class OllamaProvider:
             raise LLMTimeoutError(
                 f"Ollama API call timed out after {self.timeout}s",
                 provider="ollama",
+                retryable=True,
             ) from e
 
         except Exception as e:
@@ -1242,6 +1247,7 @@ class OllamaProvider:
             raise LLMTimeoutError(
                 f"Ollama streaming timed out after {self.timeout}s",
                 provider="ollama",
+                retryable=True,
             ) from e
 
         except Exception as e:

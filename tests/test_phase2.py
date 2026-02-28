@@ -93,6 +93,7 @@ class TestTranslateOllamaError:
         assert isinstance(result, RateLimitError)
         assert result.provider == "ollama"
         assert result.status_code == 429
+        assert result.retryable is True
 
     def test_response_error_400(self):
         err = ResponseError("bad request")
@@ -172,6 +173,11 @@ class TestTranslateOllamaError:
         assert isinstance(result, LLMTimeoutError)
         assert result.provider == "ollama"
 
+    def test_timeout_error_is_retryable(self):
+        result = _translate_ollama_error(asyncio.TimeoutError())
+        assert isinstance(result, LLMTimeoutError)
+        assert result.retryable is True
+
     def test_generic_exception(self):
         result = _translate_ollama_error(RuntimeError("boom"))
         assert isinstance(result, LLMError)
@@ -194,6 +200,15 @@ class TestErrorTranslationIntegration:
 
         assert exc_info.value.provider == "ollama"
         assert exc_info.value.__cause__ is not None
+
+    def test_timeout_error_is_retryable_through_complete(self):
+        provider = _make_provider()
+        provider.client.chat = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        with pytest.raises(LLMTimeoutError) as exc_info:
+            asyncio.run(provider.complete(_simple_request()))
+
+        assert exc_info.value.retryable is True
 
     def test_response_error_401_raises_authentication_error(self):
         provider = _make_provider()
