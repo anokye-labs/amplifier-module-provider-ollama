@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "ollama", specifier = ">=0.3.0" }]
+requires-dist = [{ name = "ollama", specifier = ">=0.4.0" }]
 
 [[package]]
 name = "annotated-types"
