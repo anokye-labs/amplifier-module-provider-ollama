@@ -31,28 +31,43 @@ class TestRetryConfigAttribute:
             max_retries=7,
             min_retry_delay=2.0,
             max_retry_delay=120.0,
-            retry_jitter=0.3,
+            retry_jitter=True,
         )
         assert provider._retry_config.max_retries == 7
-        assert provider._retry_config.min_delay == 2.0
+        assert provider._retry_config.initial_delay == 2.0
         assert provider._retry_config.max_delay == 120.0
-        assert provider._retry_config.jitter == 0.3
+        assert provider._retry_config.jitter == 0.2  # True -> 0.2 via Rust getter
 
     def test_retry_config_defaults(self, make_provider):
         provider = make_provider()
         assert provider._retry_config.max_retries == 3
-        assert provider._retry_config.min_delay == 1.0
+        assert provider._retry_config.initial_delay == 1.0
         assert provider._retry_config.max_delay == 60.0
-        assert provider._retry_config.jitter == 0.2
+        assert provider._retry_config.jitter == 0.2  # default True -> 0.2
 
-    def test_retry_jitter_bool_backward_compat(self, make_provider):
-        # True maps to 0.2
+    def test_retry_config_jitter_bool_passthrough(self, make_provider):
+        """jitter=bool is passed directly to RetryConfig, no float compat."""
         p1 = make_provider(retry_jitter=True)
-        assert p1._retry_config.jitter == 0.2
+        assert p1._retry_config.jitter == 0.2  # Rust getter: True -> 0.2
 
-        # False maps to 0.0
         p2 = make_provider(retry_jitter=False)
-        assert p2._retry_config.jitter == 0.0
+        assert p2._retry_config.jitter == 0.0  # Rust getter: False -> 0.0
+
+    def test_no_jitter_float_compat_code(self):
+        """Verify the jitter bool/float compat code has been removed from source."""
+        import inspect
+
+        source = inspect.getsource(OllamaProvider.__init__)
+        assert "raw_jitter" not in source
+        assert "isinstance(raw_jitter" not in source
+
+    def test_uses_initial_delay_not_min_delay(self):
+        """RetryConfig construction uses initial_delay=, not min_delay=."""
+        import inspect
+
+        source = inspect.getsource(OllamaProvider.__init__)
+        assert "initial_delay=" in source
+        assert "min_delay=" not in source
 
 
 # ── TestOldRetryCodeRemoved ─────────────────────────────────────────────────────

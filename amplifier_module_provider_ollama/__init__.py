@@ -275,17 +275,11 @@ class OllamaProvider:
         self._repaired_tool_ids: set[str] = set()
 
         # Retry configuration using amplifier-core's RetryConfig
-        # Backward compat: retry_jitter=True → 0.2, False → 0.0, float → as-is
-        raw_jitter = self.config.get("retry_jitter", 0.2)
-        if isinstance(raw_jitter, bool):
-            jitter = 0.2 if raw_jitter else 0.0
-        else:
-            jitter = float(raw_jitter)
         self._retry_config = RetryConfig(
             max_retries=int(self.config.get("max_retries", 3)),
-            min_delay=float(self.config.get("min_retry_delay", 1.0)),
+            initial_delay=float(self.config.get("min_retry_delay", 1.0)),
             max_delay=float(self.config.get("max_retry_delay", 60.0)),
-            jitter=jitter,
+            jitter=bool(self.config.get("retry_jitter", True)),
         )
 
     @property
