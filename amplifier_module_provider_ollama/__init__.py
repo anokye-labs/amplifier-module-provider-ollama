@@ -1755,3 +1755,12 @@ class OllamaProvider:
             else None,  # For streaming UI events
             text=combined_text or None,
         )
+
+    async def close(self) -> None:
+        """Release the Ollama client reference.
+
+        Note: ollama.AsyncClient does not expose a close() method.
+        Releasing the reference allows GC to clean up the underlying
+        httpx transport while the event loop is still alive.
+        """
+        self._client = None
