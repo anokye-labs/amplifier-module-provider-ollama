@@ -177,3 +177,157 @@ def test_multiple_missing_tool_results_all_tracked():
     ]
     assert len(repair_events) == 1
     assert repair_events[0][1]["repair_count"] == 3
+
+
+def test_synthetic_results_inserted_before_subsequent_user_message():
+    """Synthetic tool results must be inserted immediately after the assistant
+    message, NOT appended at the end after subsequent user messages.
+
+    Before the fix, the staging list + extend() pattern placed synthetics at
+    the very end, after any user messages that came after the assistant turn.
+    This caused Ollama to reject the request due to invalid message ordering.
+    """
+    provider = OllamaProvider(host="http://localhost:11434")
+    provider.client.chat = AsyncMock(return_value=make_mock_response())
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    messages = [
+        Message(
+            role="assistant",
+            content=[ToolCallBlock(id="call_xyz", name="search", input={"q": "test"})],
+        ),
+        Message(role="user", content="What did the search return?"),
+    ]
+    request = ChatRequest(messages=messages)
+
+    asyncio.run(provider.complete(request))
+
+    provider.client.chat.assert_awaited_once()
+    call_kwargs = provider.client.chat.call_args
+    ollama_msgs = call_kwargs.kwargs.get(
+        "messages", call_kwargs.args[0] if call_kwargs.args else []
+    )
+
+    # Pull out role sequence from the Ollama-format message list
+    roles = [m["role"] for m in ollama_msgs]
+
+    # The tool result must appear BEFORE the user message — not at the end
+    assert "tool" in roles, "Synthetic tool result should be present"
+    tool_idx = next(i for i, m in enumerate(ollama_msgs) if m["role"] == "tool")
+    user_idx = next(
+        i
+        for i, m in enumerate(ollama_msgs)
+        if m["role"] == "user" and m.get("content") == "What did the search return?"
+    )
+    assert tool_idx < user_idx, (
+        f"Synthetic tool result (idx={tool_idx}) must come BEFORE the subsequent "
+        f"user message (idx={user_idx}). Got roles: {roles}"
+    )
+
+
+def test_fm3_synthetic_assistant_inserted_before_next_user_message():
+    """After synthetic tool results are inserted, a synthetic assistant message
+    (FM3) should be added immediately before the next real user message so the
+    conversation structure is valid: assistant → tool(s) → assistant → user.
+    """
+    provider = OllamaProvider(host="http://localhost:11434")
+    provider.client.chat = AsyncMock(return_value=make_mock_response())
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    messages = [
+        Message(
+            role="assistant",
+            content=[
+                ToolCallBlock(id="call_fm3", name="read_file", input={"path": "/tmp/x"})
+            ],
+        ),
+        Message(role="user", content="Continue please"),
+    ]
+    request = ChatRequest(messages=messages)
+
+    asyncio.run(provider.complete(request))
+
+    provider.client.chat.assert_awaited_once()
+    call_kwargs = provider.client.chat.call_args
+    ollama_msgs = call_kwargs.kwargs.get(
+        "messages", call_kwargs.args[0] if call_kwargs.args else []
+    )
+
+    roles = [m["role"] for m in ollama_msgs]
+
+    # Must have: tool result somewhere, then assistant (FM3), then user
+    assert "tool" in roles, "Synthetic tool result should be present"
+    tool_idx = next(i for i, m in enumerate(ollama_msgs) if m["role"] == "tool")
+
+    # The message right after the tool result should be a synthetic assistant (FM3)
+    assert tool_idx + 1 < len(ollama_msgs), (
+        "There should be a message after the tool result"
+    )
+    assert ollama_msgs[tool_idx + 1]["role"] == "assistant", (
+        f"FM3: expected assistant message after tool result at idx {tool_idx + 1}, "
+        f"got '{ollama_msgs[tool_idx + 1]['role']}'. Full roles: {roles}"
+    )
+
+    # And the real user message should come after FM3
+    user_idx = next(
+        i
+        for i, m in enumerate(ollama_msgs)
+        if m["role"] == "user" and m.get("content") == "Continue please"
+    )
+    assert user_idx == tool_idx + 2, (
+        f"Real user message should be at tool_idx+2={tool_idx + 2}, "
+        f"got {user_idx}. Roles: {roles}"
+    )
+
+
+def test_fm3_not_inserted_when_no_following_user_message():
+    """FM3 synthetic assistant should NOT be inserted when there is no real
+    user message immediately following the injected tool results.
+
+    For example, if the assistant turn with missing tool calls is the last
+    message in the conversation, only the synthetic tool results are added —
+    no FM3 assistant message.
+    """
+    provider = OllamaProvider(host="http://localhost:11434")
+    provider.client.chat = AsyncMock(return_value=make_mock_response())
+    fake_coordinator = FakeCoordinator()
+    provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
+
+    # Assistant tool call is the LAST message — no subsequent user message
+    messages = [
+        Message(role="user", content="Please do something"),
+        Message(
+            role="assistant",
+            content=[
+                ToolCallBlock(id="call_last", name="run_cmd", input={"cmd": "ls"})
+            ],
+        ),
+    ]
+    request = ChatRequest(messages=messages)
+
+    asyncio.run(provider.complete(request))
+
+    provider.client.chat.assert_awaited_once()
+    call_kwargs = provider.client.chat.call_args
+    ollama_msgs = call_kwargs.kwargs.get(
+        "messages", call_kwargs.args[0] if call_kwargs.args else []
+    )
+
+    roles = [m["role"] for m in ollama_msgs]
+
+    # Synthetic tool result should be present
+    assert "tool" in roles, "Synthetic tool result should be present"
+    tool_idx = next(i for i, m in enumerate(ollama_msgs) if m["role"] == "tool")
+
+    # The message after the tool result (if any) should NOT be a synthetic
+    # assistant — since we're at the end there's nothing after
+    if tool_idx + 1 < len(ollama_msgs):
+        # If something follows, it must not be an FM3 synthetic assistant
+        # (there's no real user message to precede)
+        next_role = ollama_msgs[tool_idx + 1]["role"]
+        assert next_role != "assistant", (
+            f"FM3 should NOT be inserted when there is no following user message. "
+            f"Got '{next_role}' at idx {tool_idx + 1}. Roles: {roles}"
+        )

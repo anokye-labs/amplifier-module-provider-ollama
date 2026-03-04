@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import defaultdict
 from typing import Any
 from uuid import uuid4
 
@@ -562,22 +563,17 @@ class OllamaProvider:
 
         # Validate tool call sequences and repair if needed
         missing = self._find_missing_tool_results(request.messages)
-        extra_tool_messages: list[dict[str, Any]] = []
 
         if missing:
             logger.warning(
                 f"[PROVIDER] Ollama: Detected {len(missing)} missing tool result(s). "
                 f"Injecting synthetic errors. This indicates a bug in context management. "
-                f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
+                f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
             )
 
-            # Inject synthetic results and track repaired IDs to prevent infinite loops
-            for call_id, tool_name, _ in missing:
-                extra_tool_messages.append(
-                    self._create_synthetic_result(call_id, tool_name)
-                )
-                # Track this ID so we don't detect it as missing again in future iterations
-                self._repaired_tool_ids.add(call_id)
+            # Insert synthetic results at the correct positions in request.messages,
+            # then track repaired IDs to prevent infinite loops.
+            self._apply_jit_repair(request, missing)
 
             # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -588,7 +584,7 @@ class OllamaProvider:
                         "repair_count": len(missing),
                         "repairs": [
                             {"tool_call_id": call_id, "tool_name": tool_name}
-                            for call_id, tool_name, _ in missing
+                            for _, call_id, tool_name, _ in missing
                         ],
                     },
                 )
@@ -614,14 +610,12 @@ class OllamaProvider:
             wrapped = f"<context_file>\n{content}\n</context_file>"
             ollama_messages.append({"role": "user", "content": wrapped})
 
-        # Convert conversation messages
+        # Convert conversation messages (synthetics are already in request.messages
+        # at the correct positions from _apply_jit_repair above)
         conversation_msgs = self._convert_messages(
             [m.model_dump() for m in conversation]
         )
         ollama_messages.extend(conversation_msgs)
-
-        # Append synthetic tool results for any missing tool calls
-        ollama_messages.extend(extra_tool_messages)
 
         # Prepare request parameters
         model = kwargs.get("model", self.default_model)
@@ -920,22 +914,17 @@ class OllamaProvider:
 
         # Validate tool call sequences (same as non-streaming)
         missing = self._find_missing_tool_results(request.messages)
-        extra_tool_messages: list[dict[str, Any]] = []
 
         if missing:
             logger.warning(
                 f"[PROVIDER] Ollama: Detected {len(missing)} missing tool result(s). "
                 f"Injecting synthetic errors. This indicates a bug in context management. "
-                f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
+                f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
             )
 
-            # Inject synthetic results and track repaired IDs to prevent infinite loops
-            for call_id, tool_name, _ in missing:
-                extra_tool_messages.append(
-                    self._create_synthetic_result(call_id, tool_name)
-                )
-                # Track this ID so we don't detect it as missing again in future iterations
-                self._repaired_tool_ids.add(call_id)
+            # Insert synthetic results at the correct positions in request.messages,
+            # then track repaired IDs to prevent infinite loops.
+            self._apply_jit_repair(request, missing)
 
             # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -946,7 +935,7 @@ class OllamaProvider:
                         "repair_count": len(missing),
                         "repairs": [
                             {"tool_call_id": call_id, "tool_name": tool_name}
-                            for call_id, tool_name, _ in missing
+                            for _, call_id, tool_name, _ in missing
                         ],
                     },
                 )
@@ -970,11 +959,12 @@ class OllamaProvider:
             wrapped = f"<context_file>\n{content}\n</context_file>"
             ollama_messages.append({"role": "user", "content": wrapped})
 
+        # Convert conversation messages (synthetics are already in request.messages
+        # at the correct positions from _apply_jit_repair above)
         conversation_msgs = self._convert_messages(
             [m.model_dump() for m in conversation]
         )
         ollama_messages.extend(conversation_msgs)
-        ollama_messages.extend(extra_tool_messages)
 
         # Prepare request parameters
         model = kwargs.get("model", self.default_model)
@@ -1423,7 +1413,7 @@ class OllamaProvider:
 
     def _find_missing_tool_results(
         self, messages: list[Message]
-    ) -> list[tuple[str, str, dict]]:
+    ) -> list[tuple[int, str, str, dict]]:
         """Find tool calls without corresponding results.
 
         Scans message history to detect tool calls that were never answered
@@ -1436,12 +1426,16 @@ class OllamaProvider:
             messages: List of conversation messages
 
         Returns:
-            List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
+            List of (msg_index, call_id, tool_name, tool_arguments) tuples for
+            unpaired calls, where msg_index is the index of the assistant message
+            that made the tool call.
         """
-        tool_calls: dict[str, tuple[str, dict]] = {}  # {call_id: (name, args)}
+        tool_calls: dict[
+            str, tuple[int, str, dict]
+        ] = {}  # {call_id: (msg_idx, name, args)}
         tool_results: set[str] = set()  # {call_id}
 
-        for msg in messages:
+        for msg_idx, msg in enumerate(messages):
             if msg.role == "assistant":
                 # Check for tool calls in content blocks
                 if hasattr(msg, "content") and isinstance(msg.content, list):
@@ -1451,14 +1445,22 @@ class OllamaProvider:
                             block_name = getattr(block, "name", "unknown")
                             block_input = getattr(block, "input", {})
                             if block_id:
-                                tool_calls[block_id] = (block_name, block_input)
+                                tool_calls[block_id] = (
+                                    msg_idx,
+                                    block_name,
+                                    block_input,
+                                )
                         elif hasattr(block, "id") and hasattr(block, "name"):
                             # ToolCallBlock style
                             block_id = getattr(block, "id", "")
                             block_name = getattr(block, "name", "unknown")
                             block_input = getattr(block, "input", {})
                             if block_id:
-                                tool_calls[block_id] = (block_name, block_input)
+                                tool_calls[block_id] = (
+                                    msg_idx,
+                                    block_name,
+                                    block_input,
+                                )
                 # Also check tool_calls field
                 if hasattr(msg, "tool_calls") and msg.tool_calls:  # pyright: ignore[reportAttributeAccessIssue]
                     for tc in msg.tool_calls:  # pyright: ignore[reportAttributeAccessIssue]
@@ -1474,7 +1476,7 @@ class OllamaProvider:
                             else tc.get("arguments", {})
                         )
                         if tc_id:
-                            tool_calls[tc_id] = (tc_name, tc_args)
+                            tool_calls[tc_id] = (msg_idx, tc_name, tc_args)
             elif msg.role == "tool":
                 # Tool result - mark as received
                 tool_call_id = msg.tool_call_id if hasattr(msg, "tool_call_id") else ""
@@ -1487,10 +1489,92 @@ class OllamaProvider:
 
         # Exclude IDs that have already been repaired to prevent infinite loops
         return [
-            (call_id, name, args)
-            for call_id, (name, args) in tool_calls.items()
+            (msg_idx, call_id, name, args)
+            for call_id, (msg_idx, name, args) in tool_calls.items()
             if call_id not in tool_results and call_id not in self._repaired_tool_ids
         ]
+
+    def _create_synthetic_result_message(self, call_id: str, tool_name: str) -> Message:
+        """Create synthetic error result Message for insertion into request.messages.
+
+        Returns a Message object suitable for direct insertion into the
+        request.messages list before Ollama format conversion.
+
+        Args:
+            call_id: The ID of the tool call that needs a result
+            tool_name: The name of the tool that was called
+
+        Returns:
+            Message with role="tool" containing the synthetic error content
+        """
+        return Message(
+            role="tool",
+            tool_call_id=call_id,
+            content=(
+                f"[SYSTEM ERROR: Tool result missing from conversation history]\n\n"
+                f"Tool: {tool_name}\n"
+                f"Call ID: {call_id}\n\n"
+                f"This indicates the tool result was lost after execution.\n"
+                f"Likely causes: context compaction bug, message parsing error, or state corruption.\n\n"
+                f"The tool may have executed successfully, but the result was lost.\n"
+                f"Please acknowledge this error and offer to retry the operation."
+            ),
+        )
+
+    def _apply_jit_repair(
+        self,
+        request: "ChatRequest",
+        missing: list[tuple[int, str, str, dict]],
+    ) -> None:
+        """Insert synthetic tool results at the correct position in request.messages.
+
+        Mutates request.messages in-place. For each assistant message that has
+        unpaired tool calls, synthetic tool result messages are inserted immediately
+        after that assistant message (FM1/FM2). If the next message after the
+        inserted synthetics is a real user message, a synthetic assistant response
+        is also inserted (FM3) to close the tool turn properly.
+
+        Processing is done in reverse index order so earlier insertions don't
+        shift the indices of later ones.
+
+        Args:
+            request: ChatRequest whose messages list will be mutated in-place
+            missing: Output of _find_missing_tool_results() —
+                     list of (msg_index, call_id, tool_name, tool_args)
+        """
+        by_msg_idx: dict[int, list[tuple[str, str]]] = defaultdict(list)
+        for msg_idx, call_id, tool_name, _ in missing:
+            by_msg_idx[msg_idx].append((call_id, tool_name))
+
+        for msg_idx in sorted(by_msg_idx.keys(), reverse=True):
+            synthetics: list[Message] = []
+            for call_id, tool_name in by_msg_idx[msg_idx]:
+                synthetics.append(
+                    self._create_synthetic_result_message(call_id, tool_name)
+                )
+                self._repaired_tool_ids.add(call_id)
+
+            insert_pos = msg_idx + 1
+            for i, synthetic in enumerate(synthetics):
+                request.messages.insert(insert_pos + i, synthetic)
+
+            # FM3: if the message immediately after the injected synthetics is a
+            # real user message, insert a synthetic assistant response to close
+            # the tool turn properly before the user speaks again.
+            next_pos = insert_pos + len(synthetics)
+            if (
+                next_pos < len(request.messages)
+                and request.messages[next_pos].role == "user"
+            ):
+                fm3_msg = Message(
+                    role="assistant",
+                    content=(
+                        "[SYSTEM NOTE: Previous tool results were missing from "
+                        "conversation history. Synthetic error responses were "
+                        "injected to maintain valid conversation structure.]"
+                    ),
+                )
+                request.messages.insert(next_pos, fm3_msg)
 
     def _create_synthetic_result(self, call_id: str, tool_name: str) -> dict[str, Any]:
         """Create synthetic error result for missing tool response.
