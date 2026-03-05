@@ -737,7 +737,7 @@ class OllamaProvider:
                     },
                 )
 
-            # RAW level: Full request payload (if raw_debug enabled)
+            # RAW level: Full request payload (if debug and raw_debug enabled)
             if self.debug and self.raw_debug:
                 await self.coordinator.hooks.emit(
                     "llm:request:raw",
@@ -840,7 +840,7 @@ class OllamaProvider:
                         },
                     )
 
-                # RAW level: Full response (if raw_debug enabled)
+                # RAW level: Full response (if debug and raw_debug enabled)
                 if self.debug and self.raw_debug:
                     await self.coordinator.hooks.emit(
                         "llm:response:raw",
@@ -1085,7 +1085,7 @@ class OllamaProvider:
                     },
                 )
 
-            # RAW level: Full request payload (if raw_debug enabled)
+            # RAW level: Full request payload (if debug and raw_debug enabled)
             if self.debug and self.raw_debug:
                 await self.coordinator.hooks.emit(
                     "llm:request:raw",
@@ -1227,7 +1227,7 @@ class OllamaProvider:
                         },
                     )
 
-                # RAW level: Full response (if raw_debug enabled)
+                # RAW level: Full response (if debug and raw_debug enabled)
                 if self.debug and self.raw_debug:
                     await self.coordinator.hooks.emit(
                         "llm:response:raw",
