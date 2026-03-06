@@ -58,48 +58,6 @@ class OllamaChatResponse(ChatResponse):
     text: str | None = None
 
 
-def _truncate_values(
-    obj: Any,
-    max_length: int = 200,
-    max_depth: int = 10,
-    _depth: int = 0,
-) -> Any:
-    """Truncate long strings in nested structures for logging.
-
-    Args:
-        obj: Object to truncate (dict, list, str, or other)
-        max_length: Maximum length for strings before truncation
-        max_depth: Maximum recursion depth
-        _depth: Current recursion depth (internal)
-
-    Returns:
-        Truncated copy of the object
-    """
-    if _depth > max_depth:
-        return "..."
-
-    if isinstance(obj, str):
-        if len(obj) > max_length:
-            return obj[:max_length] + f"... ({len(obj)} chars)"
-        return obj
-    if isinstance(obj, dict):
-        return {
-            k: _truncate_values(v, max_length, max_depth, _depth + 1)
-            for k, v in obj.items()
-        }
-    if isinstance(obj, list):
-        if len(obj) > 10:
-            truncated = [
-                _truncate_values(item, max_length, max_depth, _depth + 1)
-                for item in obj[:10]
-            ]
-            return truncated + [f"... ({len(obj)} items total)"]
-        return [
-            _truncate_values(item, max_length, max_depth, _depth + 1) for item in obj
-        ]
-    return obj
-
-
 def _translate_ollama_error(e: Exception) -> LLMError:  # pyright: ignore[reportReturnType]
     """Translate native Ollama/connection errors to kernel LLM error types.
 
@@ -226,10 +184,7 @@ class OllamaProvider:
             self.config.get("timeout", 600.0)
         )  # API timeout in seconds (default 10 min - local models need longer for prefill)
         self.auto_pull = self.config.get("auto_pull", False)
-        self.debug = self.config.get("debug", False)
-        self.raw_debug = self.config.get(
-            "raw_debug", False
-        )  # Enable ultra-verbose raw API I/O logging
+        self.raw = self.config.get("raw", False)
         # Context window size (num_ctx in ollama) - 0 means auto-detect from model
         self.num_ctx = int(self.config.get("num_ctx", 0))
         # Cache for model context lengths (avoid repeated API calls)
@@ -710,43 +665,14 @@ class OllamaProvider:
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
-            # INFO level: Summary only
-            await self.coordinator.hooks.emit(
-                "llm:request",
-                {
-                    "provider": "ollama",
-                    "model": model,
-                    "message_count": len(ollama_messages),
-                },
-            )
-
-            # DEBUG level: Truncated request payload (if debug enabled)
-            if self.debug:
-                await self.coordinator.hooks.emit(
-                    "llm:request:debug",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": "ollama",
-                        "request": _truncate_values(
-                            {
-                                "model": model,
-                                "messages": ollama_messages,
-                                "options": params.get("options", {}),
-                            }
-                        ),
-                    },
-                )
-
-            # RAW level: Full request payload (if raw_debug enabled)
-            if self.raw_debug:
-                await self.coordinator.hooks.emit(
-                    "llm:request:raw",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": "ollama",
-                        "request": params,
-                    },
-                )
+            request_payload: dict[str, Any] = {
+                "provider": "ollama",
+                "model": model,
+                "message_count": len(ollama_messages),
+            }
+            if self.raw:
+                request_payload["raw"] = params
+            await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
 
@@ -815,43 +741,16 @@ class OllamaProvider:
                 if "eval_count" in response:
                     usage_info["output"] = response.get("eval_count", 0)
 
-                # INFO level: Summary only
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "ollama",
-                        "model": model,
-                        "usage": usage_info,
-                        "status": "ok",
-                        "duration_ms": elapsed_ms,
-                    },
-                )
-
-                # DEBUG level: Truncated response (if debug enabled)
-                if self.debug:
-                    await self.coordinator.hooks.emit(
-                        "llm:response:debug",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "ollama",
-                            "response": _truncate_values(response),
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                        },
-                    )
-
-                # RAW level: Full response (if raw_debug enabled)
-                if self.raw_debug:
-                    await self.coordinator.hooks.emit(
-                        "llm:response:raw",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "ollama",
-                            "response": response,
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                        },
-                    )
+                response_payload: dict[str, Any] = {
+                    "provider": "ollama",
+                    "model": model,
+                    "usage": usage_info,
+                    "status": "ok",
+                    "duration_ms": elapsed_ms,
+                }
+                if self.raw:
+                    response_payload["raw"] = response
+                await self.coordinator.hooks.emit("llm:response", response_payload)
 
             # Convert to OllamaChatResponse
             return self._convert_to_chat_response(
@@ -1056,46 +955,15 @@ class OllamaProvider:
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
-            # INFO level: Summary only
-            await self.coordinator.hooks.emit(
-                "llm:request",
-                {
-                    "provider": "ollama",
-                    "model": model,
-                    "message_count": len(ollama_messages),
-                    "stream": True,
-                },
-            )
-
-            # DEBUG level: Truncated request payload (if debug enabled)
-            if self.debug:
-                await self.coordinator.hooks.emit(
-                    "llm:request:debug",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": "ollama",
-                        "stream": True,
-                        "request": _truncate_values(
-                            {
-                                "model": model,
-                                "messages": ollama_messages,
-                                "options": params.get("options", {}),
-                            }
-                        ),
-                    },
-                )
-
-            # RAW level: Full request payload (if raw_debug enabled)
-            if self.raw_debug:
-                await self.coordinator.hooks.emit(
-                    "llm:request:raw",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": "ollama",
-                        "stream": True,
-                        "request": params,
-                    },
-                )
+            stream_request_payload: dict[str, Any] = {
+                "provider": "ollama",
+                "model": model,
+                "message_count": len(ollama_messages),
+                "stream": True,
+            }
+            if self.raw:
+                stream_request_payload["raw"] = params
+            await self.coordinator.hooks.emit("llm:request", stream_request_payload)
 
         start_time = time.time()
         accumulated_content = ""
@@ -1193,59 +1061,25 @@ class OllamaProvider:
                     if "eval_count" in final_chunk:
                         usage_info["output"] = final_chunk.get("eval_count", 0)
 
+                stream_response_payload: dict[str, Any] = {
+                    "provider": "ollama",
+                    "model": model,
+                    "usage": usage_info,
+                    "status": "ok",
+                    "duration_ms": elapsed_ms,
+                    "stream": True,
+                }
+                if self.raw:
+                    stream_response_payload["raw"] = {
+                        "content": accumulated_content,
+                        "thinking": accumulated_thinking
+                        if accumulated_thinking
+                        else None,
+                        "final_chunk": final_chunk,
+                    }
                 await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "ollama",
-                        "model": model,
-                        "usage": usage_info,
-                        "status": "ok",
-                        "duration_ms": elapsed_ms,
-                        "stream": True,
-                    },
+                    "llm:response", stream_response_payload
                 )
-
-                # DEBUG level: Truncated response (if debug enabled)
-                if self.debug:
-                    await self.coordinator.hooks.emit(
-                        "llm:response:debug",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "ollama",
-                            "stream": True,
-                            "response": _truncate_values(
-                                {
-                                    "content": accumulated_content,
-                                    "thinking": accumulated_thinking
-                                    if accumulated_thinking
-                                    else None,
-                                    "final_chunk": final_chunk,
-                                }
-                            ),
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                        },
-                    )
-
-                # RAW level: Full response (if raw_debug enabled)
-                if self.raw_debug:
-                    await self.coordinator.hooks.emit(
-                        "llm:response:raw",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "ollama",
-                            "stream": True,
-                            "response": {
-                                "content": accumulated_content,
-                                "thinking": accumulated_thinking
-                                if accumulated_thinking
-                                else None,
-                                "final_chunk": final_chunk,
-                            },
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                        },
-                    )
 
             # Build final response
             return self._build_streaming_response(
@@ -1390,7 +1224,7 @@ class OllamaProvider:
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
             finish_reason=final_chunk.get("done_reason") if final_chunk else None,
-            raw_response=final_chunk if self.raw_debug else None,
+            raw_response=final_chunk if self.raw else None,
             model_name=final_chunk.get("model") if final_chunk else None,
             thinking_content=thinking_content,
             content_blocks=event_blocks
@@ -1831,7 +1665,7 @@ class OllamaProvider:
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
             finish_reason=response.get("done_reason") or None,
-            raw_response=response if self.raw_debug else None,
+            raw_response=response if self.raw else None,
             model_name=response.get("model"),
             thinking_content=thinking_content,
             content_blocks=event_blocks
