@@ -1,0 +1,54 @@
+name: PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-title:
+    name: pr-title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const title = (context.payload.pull_request.title || '').trim();
+
+            if (!title) {
+              core.setFailed('PR title cannot be empty.');
+              return;
+            }
+
+            const isDependabotStyle = /^bump\s+.+\s+from\s+.+\s+to\s+.+$/i.test(title)
+              || /^(build|chore)(\([^)]*\))?:\s*bump\s+/i.test(title);
+
+            if (isDependabotStyle) {
+              core.info('Dependabot-style bump title allowed.');
+              return;
+            }
+
+            const invalidPatterns = [
+              /^wip\b/i,
+              /^\[\s*wip\s*\]/i,
+              /^\(\s*wip\s*\)/i,
+              /^draft\b/i,
+              /^\[\s*draft\s*\]/i,
+              /^\(\s*draft\s*\)/i,
+              /^(dnm|do not merge)\b/i,
+            ];
+
+            if (invalidPatterns.some((pattern) => pattern.test(title))) {
+              core.setFailed('PR title appears to be WIP/draft-style. Update it to a reviewable title.');
+              return;
+            }
+
+            core.info(`PR title accepted: ${title}`);

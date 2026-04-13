@@ -1,0 +1,49 @@
+name: Linked Issue
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-linked-issue:
+    name: check-linked-issue
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate linked issue policy
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const bypassLabel = 'no-linked-issue-required';
+            const botActors = new Set(['dependabot[bot]', 'renovate[bot]', 'github-actions[bot]']);
+
+            if (botActors.has(pr.user.login)) {
+              core.info(`Skipping linked-issue check for trusted bot actor: ${pr.user.login}`);
+              return;
+            }
+
+            if (pr.labels.some((label) => label.name === bypassLabel)) {
+              core.info(`Bypass label present: ${bypassLabel}`);
+              return;
+            }
+
+            const combined = `${pr.title ?? ''}\n${pr.body ?? ''}`;
+            const issueRefPattern = /(^|[\s([])#\d+\b/m;
+            const issueUrlPattern = /https:\/\/github\.com\/[^\/\s]+\/[^\/\s]+\/issues\/\d+\b/i;
+
+            if (issueRefPattern.test(combined) || issueUrlPattern.test(combined)) {
+              core.info('Issue reference found in PR title or body.');
+              return;
+            }
+
+            core.setFailed(
+              'PRs must reference an issue in the title or body (for example `Closes #123`) unless the `no-linked-issue-required` label is applied.'
+            );
